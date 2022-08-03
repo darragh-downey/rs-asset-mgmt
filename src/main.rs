@@ -1,16 +1,11 @@
-use chrono::prelude::*;
 use crossterm::{
     event::{self, Event as CEvent, KeyCode},
     terminal::{disable_raw_mode, enable_raw_mode},
 };
-use rand::{distributions::Alphanumeric, prelude::*};
-use serde::{Deserialize, Serialize};
-use std::fs;
 use std::io;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
-use thiserror::Error;
 use tui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout},
@@ -23,26 +18,10 @@ use tui::{
 };
 
 
-const DB_PATH: &str = "./data/db.json";
-
-
-#[derive(Serialize, Deserialize, Clone)]
-struct Asset {
-    id: usize,
-    name: String,
-    category: String,
-    vulnerabilities: usize,
-    created_at: DateTime<Utc>,
-}
-
-
-#[derive(Error, Debug)]
-pub enum Error {
-    #[error("error reading the DB file: {0}")]
-    ReadDBError(#[from] io::Error),
-    #[error("error parsing the DB file: {0}")]
-    ParseDBError(#[from] serde_json::Error),
-}
+mod db;
+// mod fetch;
+mod start;
+mod zip;
 
 
 enum Event<I> {
@@ -67,8 +46,15 @@ impl From<MenuItem> for usize {
 }
 
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode().expect("can run in raw mode");
+    // let _data = fetch::fetch();
+    // run in background
+    // should aim to copy the xml to a local sqlite or json for querying
+    start::init().await;
+    // need to move this to init
+    let _data = zip::fetch();
 
     let (tx, rx) = mpsc::channel();
     let tick_rate = Duration::from_millis(200);
@@ -96,12 +82,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    terminal.clear();
+    terminal.clear().or(Err(format!("failed to clear terminal")))?;
 
-    let menu_titles = vec!["Home", "Assets", "Add", "Delete", "Quit"];
+    let menu_titles = vec!["Home", "Assets", "Add", "Delete", "Quit", "Fetch"];
     let mut active_menu_item = MenuItem::Home;
-    let mut pet_list_state = ListState::default();
-    pet_list_state.select(Some(0));
+    let mut asset_list_state = ListState::default();
+    asset_list_state.select(Some(0));
 
     loop {
         terminal.draw(|rect| {
@@ -157,16 +143,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match active_menu_item {
                 MenuItem::Home => rect.render_widget(render_home(), chunks[1]),
                 MenuItem::Assets => {
-                    let pet_chunks = Layout::default()
+                    let asset_chunks = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints(
                             [Constraint::Percentage(20), Constraint::Percentage(80)].as_ref(),
                         )
                         .split(chunks[1]);
 
-                    let (left, right) = render_assets(&pet_list_state);
-                    rect.render_stateful_widget(left, pet_chunks[0], &mut pet_list_state);
-                    rect.render_widget(right, pet_chunks[1]);
+                    let (left, right) = render_assets(&asset_list_state);
+                    rect.render_stateful_widget(left, asset_chunks[0], &mut asset_list_state);
+                    rect.render_widget(right, asset_chunks[1]);
                 }
             }
 
@@ -183,28 +169,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 KeyCode::Char('h') => active_menu_item = MenuItem::Home,
                 KeyCode::Char('p') => active_menu_item = MenuItem::Assets,
                 KeyCode::Char('a') => {
-                    add_random_pet_to_db().expect("can add new pet");
+                    db::add_random_asset_to_db().expect("can add new asset");
                 }
                 KeyCode::Char('d') => {
-                    remove_pet_at_index(&mut pet_list_state).expect("can remove pet");
+                    db::remove_asset_at_index(&mut asset_list_state).expect("can remove asset");
+                }
+                KeyCode::Char('f') => {
+                        zip::fetch().await?;
                 }
                 KeyCode::Down => {
-                    if let Some(selected) = pet_list_state.selected() {
-                        let amount_assets = read_db().expect("can fetch pet list").len();
+                    if let Some(selected) = asset_list_state.selected() {
+                        let amount_assets = db::read_db().expect("can fetch asset list").len();
                         if selected >= amount_assets - 1 {
-                            pet_list_state.select(Some(0));
+                            asset_list_state.select(Some(0));
                         } else {
-                            pet_list_state.select(Some(selected + 1));
+                            asset_list_state.select(Some(selected + 1));
                         }
                     }
                 }
                 KeyCode::Up => {
-                    if let Some(selected) = pet_list_state.selected() {
-                        let amount_assets = read_db().expect("can fetch pet list").len();
+                    if let Some(selected) = asset_list_state.selected() {
+                        let amount_assets = db::read_db().expect("can fetch asset list").len();
                         if selected > 0 {
-                            pet_list_state.select(Some(selected -1));
+                            asset_list_state.select(Some(selected -1));
                         } else {
-                            pet_list_state.select(Some(amount_assets - 1));
+                            asset_list_state.select(Some(amount_assets - 1));
                         }
                     }
                 }
@@ -232,7 +221,7 @@ fn render_home<'a>() -> Paragraph<'a> {
                 Style::default().fg(Color::LightBlue),
         )]),
         Spans::from(vec![Span::raw("")]),
-        Spans::from(vec![Span::raw("Press 'p' to access assets, 'a' to add new assets and 'd' to delete the currently selected pet")]),
+        Spans::from(vec![Span::raw("Press 'v' to view assets, 'a' to add new assets, 'd' to delete the currently selected asset, and 'f' to update vulnerabilities")]),
         ])
         .alignment(Alignment::Center)
         .block(
@@ -246,29 +235,29 @@ fn render_home<'a>() -> Paragraph<'a> {
 }
 
 
-fn render_assets<'a>(pet_list_state: &ListState) -> (List<'a>, Table<'a>) {
+fn render_assets<'a>(asset_list_state: &ListState) -> (List<'a>, Table<'a>) {
     let assets = Block::default()
         .borders(Borders::ALL)
         .style(Style::default().fg(Color::White))
         .title("Assets")
         .border_type(BorderType::Plain);
 
-    let pet_list = read_db().expect("can fetch pet list");
-    let items: Vec<_> = pet_list
+    let asset_list = db::read_db().expect("can fetch asset list");
+    let items: Vec<_> = asset_list
         .iter()
-        .map(|pet| {
+        .map(|asset| {
             ListItem::new(Spans::from(vec![Span::styled(
-                        pet.name.clone(),
+                        asset.name.clone(),
                         Style::default(),
             )]))
         })
     .collect();
 
-    let selected_pet = pet_list
+    let selected_asset = asset_list
         .get(
-            pet_list_state
+            asset_list_state
             .selected()
-            .expect("there is always a selected pet"),
+            .expect("there is always a selected asset"),
             )
         .expect("exists")
         .clone();
@@ -280,12 +269,12 @@ fn render_assets<'a>(pet_list_state: &ListState) -> (List<'a>, Table<'a>) {
         .add_modifier(Modifier::BOLD),
     );
 
-    let pet_detail = Table::new(vec![Row::new(vec![
-            Cell::from(Span::raw(selected_pet.id.to_string())),
-            Cell::from(Span::raw(selected_pet.name)),
-            Cell::from(Span::raw(selected_pet.category)),
-            Cell::from(Span::raw(selected_pet.vulnerabilities.to_string())),
-            Cell::from(Span::raw(selected_pet.created_at.to_string())),
+    let asset_detail = Table::new(vec![Row::new(vec![
+            Cell::from(Span::raw(selected_asset.id.to_string())),
+            Cell::from(Span::raw(selected_asset.name)),
+            Cell::from(Span::raw(selected_asset.category)),
+            Cell::from(Span::raw(selected_asset.vulnerabilities.to_string())),
+            Cell::from(Span::raw(selected_asset.created_at.to_string())),
     ])])
         .header(Row::new(vec![
                 Cell::from(Span::styled(
@@ -324,55 +313,7 @@ fn render_assets<'a>(pet_list_state: &ListState) -> (List<'a>, Table<'a>) {
                 Constraint::Percentage(20),
             ]);
 
-    (list, pet_detail)
+    (list, asset_detail)
 }
 
-
-
-fn read_db() -> Result<Vec<Asset>, Error> {
-    let db_content = fs::read_to_string(DB_PATH)?;
-    let parsed: Vec<Asset> = serde_json::from_str(&db_content)?;
-    Ok(parsed)
-}
-
-
-fn remove_pet_at_index(pet_list_state: &mut ListState) -> Result<(), Error> {
-    if let Some(selected) = pet_list_state.selected() {
-        let db_content = fs::read_to_string(DB_PATH)?;
-        let mut parsed: Vec<Asset> = serde_json::from_str(&db_content)?;
-        parsed.remove(selected);
-        fs::write(DB_PATH, &serde_json::to_vec(&parsed)?)?;
-        let _amount_assets = read_db().expect("can fetch asset list").len(); // remaining assets you're tracking
-        if selected > 0 {
-            pet_list_state.select(Some(selected - 1));
-        } else {
-            pet_list_state.select(Some(0));
-        }
-    }
-    Ok(())
-}
-
-
-
-fn add_random_pet_to_db() -> Result<Vec<Asset>, Error> {
-    let mut rng = rand::thread_rng();
-    let db_content = fs::read_to_string(DB_PATH)?;
-    let mut parsed: Vec<Asset> = serde_json::from_str(&db_content)?;
-    let catsdogs = match rng.gen_range(0, 1) {
-        0 => "hardware",
-        _ => "software",
-    };
-
-    let random_pet = Asset {
-        id: rng.gen_range(0, 9999999),
-        name: rng.sample_iter(Alphanumeric).take(10).collect(),
-        category: catsdogs.to_owned(),
-        vulnerabilities: rng.gen_range(1, 15),
-        created_at: Utc::now(),
-    };
-    
-    parsed.push(random_pet);
-    fs::write(DB_PATH, &serde_json::to_vec(&parsed)?)?;
-    Ok(parsed)
-}
 
